@@ -45,7 +45,7 @@ type TotpAuthenticationFactor(config:TotpAuthenticationFactorConfig) =
     let config = config
     let mutable disposed = false;
 
-    let cleanup(disposing:bool) = 
+    let cleanup(disposing) = 
         if not disposed then
             disposed <- true
             if disposing then
@@ -101,22 +101,38 @@ type SecondFactorAuthControllerConfig() =
 @startuml
 title SecondFactorAuthController State Model
 [*] --> LoginPassed : correct user and password
-LoginPassed --> AccountLocked
-LoginPassed --> ShareSecret : not configured
-ShareSecret --> CodeConfirmation
-LoginPassed --> CodeConfirmation : 2FA enabled
-LoginPassed --> LoginSucceeded : 2FA disabled
-CodeConfirmation --> LoginSucceeded : correct code
-CodeConfirmation --> CodeFailure
-CodeFailure --> CodeConfirmation
-CodeFailure --> AccountLocked : fault threshold
-LoginSucceeded -> [*]
-AccountLocked -> [*]
-ShareSecret: generate 32 byte base32 secret
-CodeConfirmation: confirm range of codes n<-time->n
+
+state Configuration {
+ state PrepareConfig: create shared secret
+ state ConfirmConfig
+ state Configured: save shared secred into account
+ PrepareConfig-->ConfirmConfig
+ ConfirmConfig-->ConfirmConfig: wrong code
+ ConfirmConfig-->Configured
+}
+
+LoginPassed-->PrepareConfig: 2FA not configured
+Configured-->LoginSucceeded
+
+state SecondFactor {
+ state CodeValidation: validate TOTP code
+ state FaultValidation: increment and store fault cntr
+ CodeValidation-->FaultValidation: wrong code
+}
+
+LoginPassed-->CodeValidation: 2FA enabled
+CodeValidation-->LoginSucceeded: correct code
+FaultValidation-->AccountLocked
+
+LoginPassed-->LoginSucceeded: 2FA disabled
+LoginPassed-->AccountLocked: account locked
+AccountLocked-->[*]
+LoginSucceeded-->[*]
+
 LoginSucceeded: proceed with requested page
-CodeFailure: increment and store faults
-@enduml*)
+AccountLocked: proceed to unlock account
+@enduml
+*)
 type SecondFactorAuthController(config:SecondFactorAuthControllerConfig, store:IAuthenticationFactorAccountStorage,
                                 secfact:TotpAuthenticationFactor, renderers:SecondFactorAuthControllerStates) =
     let config = config
@@ -138,7 +154,7 @@ type SecondFactorAuthController(config:SecondFactorAuthControllerConfig, store:I
                             new StrongAuthFactorAccountSettings(
                                     auth.SecondFactor.Status,
                                     auth.SecondFactor.Secret,
-                                    uint8 0),
+                                    auth.SecondFactor.FaultAttempts+uint8 1),
                             auth.Locked)
         store.SetStrongAuthFactorAccountSettings login auth
 
@@ -159,8 +175,8 @@ type SecondFactorAuthController(config:SecondFactorAuthControllerConfig, store:I
             match auth.SecondFactor.Status with
                 | StrongAuthFactorStatus.NotConfigured -> 
                     let newauth = new StrongAuthFactorAccountSettings(StrongAuthFactorStatus.Enabled, secfact.GenerateSharedSecret, uint8 0)
-                    store.SetStrongAuthFactorAccountSettings login (new AuthAccountSettings(newauth, true))
-                    r.CodeConfirmPage [newauth.Secret]
+                    store.SetStrongAuthFactorAccountSettings login (new AuthAccountSettings(newauth, auth.Locked))
+                    r.SecretPage [newauth.Secret]
                 | StrongAuthFactorStatus.Enabled ->
                     match code with
                     | "" -> r.CodeConfirmPage []
@@ -196,7 +212,7 @@ type BackofficeAccountController(store:IAuthenticationFactorAccountStorage, r:Ba
                                     StrongAuthFactorStatus.NotConfigured,
                                     "",
                                     uint8 0),
-                            true)
+                            false)
         store.SetStrongAuthFactorAccountSettings login newauth
 
     member __.RunState (vars: string list) =
